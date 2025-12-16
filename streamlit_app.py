@@ -120,16 +120,17 @@ def format_event_label(ev):
 
 
 # ---------- main ----------
-st.set_page_config(page_title="バイトシフト作成（Streamlit）", layout="wide")
+st.set_page_config(page_title="バイトシフト作成", layout="wide")
 init_db()
 
-st.title("📅 バイトシフト作成アプリ（Streamlit版）")
+st.title("📅 バイトシフト作成アプリ")
 
 # 年月選択
 today = date.today()
 c1, c2 = st.columns(2)
 year = c1.number_input("年", 2020, 2035, today.year, 1)
 month = c2.selectbox("月", list(range(1, 13)), index=today.month - 1)
+
 
 # サイドバー：予定追加
 st.sidebar.header("➕ 予定を追加")
@@ -200,19 +201,47 @@ html = """
     font-weight: bold;
     margin-bottom: 4px;
 }
+.dow.sun {
+    color: #d32f2f;
+    background: #fdecea;
+}
+
+.dow.sat {
+    color: #1976d2;
+    background: #e3f2fd;
+}
+
+.cell.sun .day {
+    color: #d32f2f;
+}
+
+.cell.sat .day {
+    color: #1976d2;
+}
+
 </style>
 
 <div class="calendar">
 """
+
+dows = ["日", "月", "火", "水", "木", "金", "土"]
+dow_classes = ["sun", "", "", "", "", "", "sat"]
+
+for d, cls in zip(dows, dow_classes):
+    html += f'<div class="dow {cls}">{d}</div>'
+
 
 for week in weeks:
     for day in week:
         if day == 0:
             html += '<div class="cell"></div>'
         else:
-            day_key = f"{year}-{month:02d}-{day:02d}"
-            html += f'<div class="cell"><div class="day">{day}</div>'
+            weekday = calendar.weekday(year, month, day)  # Mon=0 ... Sun=6
+            cell_class = "sun" if weekday == 6 else "sat" if weekday == 5 else ""
 
+            day_key = f"{year}-{month:02d}-{day:02d}"
+            html += f'<div class="cell {cell_class}"><div class="day">{day}</div>'
+            
             for ev in events_by_date.get(day_key, []):
                 label = format_event_label(ev)
                 html += badge_html(label, ev["category"])
