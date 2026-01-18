@@ -5,8 +5,13 @@ import sqlite3
 from datetime import date, datetime, time, timedelta
 from typing import Optional
 
+import re
+import json
+
+
 import streamlit as st
 from streamlit_calendar import calendar as st_calendar
+
 
 
 # =========================
@@ -677,22 +682,52 @@ calendar_options = {
     "dayMaxEvents": True,
     "eventDisplay": "block",
     "headerToolbar": False,
+    "selectable": True,
+    "unselectAuto": True,
 }
 
 state = st_calendar(
     events=fc_events,
     options=calendar_options,
-    callbacks=["dateClick", "eventClick"],
+    callbacks={
+        "dateClick": "function(info) { return info; }",
+        "eventClick": "function(info) { return info; }",
+    },
     key=f"calendar_{year}_{month}_{st.session_state['cal_gen']}",
 )
 
-# クリック処理（クリック日付を固定してから開く）
-if st.session_state["skip_next_dateclick"]:
-    st.session_state["skip_next_dateclick"] = False
-elif state and "dateClick" in state:
-    # state["dateClick"]["dateStr"] を直接使用してダイアログを起動
-    clicked_date = state["dateClick"]["dateStr"].split("T")[0]
-    show_add_event_dialog(clicked_date)
+
+st.write("DEBUG keys:", list((state or {}).keys()))
+st.write("DEBUG dateClick raw:", (state or {}).get("dateClick"))
+st.write("DEBUG eventClick raw:", (state or {}).get("eventClick"))
+
+
+# ===== カレンダー state を安全に読む =====
+def extract_ymd(x) -> str:
+    s = json.dumps(x, ensure_ascii=False)
+    m = re.search(r"\d{4}-\d{2}-\d{2}", s)
+    return m.group(0) if m else ""
+
+# DEBUG（まずここで中身を見る）
+st.write("DEBUG state")
+st.json(state)
+
+# ===== クリック処理 =====
+dc = (state or {}).get("dateClick")
+if dc:
+    clicked_date = extract_ymd(dc)
+    st.toast(f"clicked_date={clicked_date}", icon="✅")
+    if clicked_date:
+        st.session_state["selected_date"] = clicked_date
+        st.session_state["open_add_dialog"] = True
+        st.rerun()
+
+# rerun後に1回だけ dialog を開く
+if st.session_state.get("open_add_dialog", False):
+    st.session_state["open_add_dialog"] = False
+    show_add_event_dialog()
+
+
 
 
 
