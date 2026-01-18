@@ -442,7 +442,7 @@ if "month" not in st.session_state:
 
 c1, c2 = st.columns(2)
 year = c1.number_input("年", 2020, 2035, st.session_state["year"], 1, key="year")
-month = c2.selectbox("月", list(range(1, 13)), index=st.session_state["month"] - 1, key="month")
+month = c2.number_input("月", 1, 12, st.session_state["month"], 1, key="month")
 
 
 ym_key = f"{year}-{month:02d}"
