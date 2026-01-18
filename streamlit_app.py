@@ -441,8 +441,13 @@ if "month" not in st.session_state:
     st.session_state["month"] = today.month
 
 c1, c2 = st.columns(2)
-year = c1.number_input("年", 2020, 2035, st.session_state["year"], 1, key="year")
-month = c2.number_input("月", 1, 12, st.session_state["month"], 1, key="month")
+
+c1.number_input("年", 2020, 2035, step=1, key="year")
+c2.number_input("月", 1, 12, step=1, key="month")
+
+year = int(st.session_state["year"])
+month = int(st.session_state["month"])
+
 
 
 ym_key = f"{year}-{month:02d}"
