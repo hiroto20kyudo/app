@@ -603,7 +603,7 @@ calendar_options = {
     "dayMaxEvents": True,
     "eventDisplay": "block",
     "headerToolbar": {
-        "left": "today prev,next",
+        "left": "",
         "center": "title",
         "right": "",
     },
@@ -656,21 +656,6 @@ if state and state.get("datesSet"):
                 st.rerun()
 
 
-# ★カレンダー矢印で月移動したら、Streamlitのyear/monthも追従させる
-if state and state.get("datesSet"):
-    ds = state["datesSet"]
-    start_str = (ds.get("startStr") or ds.get("start") or "")[:10]  # "YYYY-MM-DD"
-
-    if start_str:
-        y, m, _ = map(int, start_str.split("-"))
-        mid = date(y, m, 15)
-
-        st.session_state["year"] = mid.year
-        st.session_state["month"] = mid.month
-
-        st.session_state["skip_next_dateclick"] = True
-        st.rerun()
-
 
 
 # クリックイベントがrerun後に残って勝手にダイアログが開くのを防ぐ
@@ -696,7 +681,6 @@ else:
 st.divider()
 st.subheader("🗂 この月の予定一覧（削除）")
 flat = [ev for evs in events_by_date.values() for ev in evs]
-
 if not flat:
     st.info("この月の予定はまだありません。予定を追加してね")
 else:
@@ -705,7 +689,6 @@ else:
         cols[0].write(f"{ev['date']} | {format_event_label(ev)} | [{ev['category']}]")
         if cols[1].button("削除", key=f"del_{ev['id']}"):
             delete_event(ev["id"])
-
             # ★ 削除 → rerun でも dateClick が残って再度ダイアログが開くのを防ぐ
             st.session_state["cal_gen"] = st.session_state.get("cal_gen", 0) + 1
             st.session_state["skip_next_dateclick"] = True
