@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import sqlite3
 import calendar
-from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Optional
 
 import streamlit as st
 from streamlit_calendar import calendar as st_calendar
+
+import os
+st.caption(f"RUNNING FILE: {os.path.abspath(__file__)}")
+
 
 DB_PATH = "app.db"
 
@@ -27,20 +30,20 @@ def init_db():
         ev_date TEXT NOT NULL,          -- YYYY-MM-DD
         start_time TEXT,                -- HH:MM (nullable, 終日はNULLでもOK)
         end_time TEXT,                  -- HH:MM
-        category TEXT NOT NULL,          -- class / job / private / work / proposal
+        category TEXT NOT NULL,         -- class / job / private / work / proposal
         title TEXT NOT NULL,
-        place TEXT                       -- store名など（任意）
+        place TEXT                      -- store名など（任意）
     );
     """)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS availability (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        workplace TEXT NOT NULL,         -- サンマルク / 成城石井
-        day_type TEXT NOT NULL,          -- weekday / weekend / dow
-        dow INTEGER,                     -- 0=Mon..6=Sun（day_type='dow'の時だけ）
-        start_time TEXT NOT NULL,        -- HH:MM
-        end_time TEXT NOT NULL           -- HH:MM
+        workplace TEXT NOT NULL,        -- サンマルク / 成城石井
+        day_type TEXT NOT NULL,         -- weekday / weekend / dow
+        dow INTEGER,                    -- 0=Mon..6=Sun（day_type='dow'の時だけ）
+        start_time TEXT NOT NULL,       -- HH:MM
+        end_time TEXT NOT NULL          -- HH:MM
     );
     """)
 
@@ -140,17 +143,10 @@ def fetch_events_between(start_date: str, end_date: str):
     conn.close()
 
     return [
-        {
-            "id": r[0],
-            "date": r[1],
-            "start": r[2],
-            "end": r[3],
-            "category": r[4],
-            "title": r[5],
-            "place": r[6],
-        }
+        {"id": r[0], "date": r[1], "start": r[2], "end": r[3], "category": r[4], "title": r[5], "place": r[6]}
         for r in rows
     ]
+
 
 # ---------- DB (proposal config) ----------
 def upsert_settings(max_day: int, max_week: int):
@@ -231,14 +227,7 @@ def get_availabilities() -> list[dict]:
     rows = cur.fetchall()
     conn.close()
     return [
-        {
-            "id": r[0],
-            "workplace": r[1],
-            "day_type": r[2],
-            "dow": r[3],
-            "start_time": r[4],
-            "end_time": r[5],
-        }
+        {"id": r[0], "workplace": r[1], "day_type": r[2], "dow": r[3], "start_time": r[4], "end_time": r[5]}
         for r in rows
     ]
 
@@ -257,22 +246,22 @@ def delete_proposals_in_range(start_date: str, end_date: str):
     conn.close()
 
 
-
 # ---------- Proposal logic ----------
 def _t(s: str) -> time:
     return datetime.strptime(s, "%H:%M").time()
+
 
 def monday_of(d: date) -> date:
     return d - timedelta(days=d.weekday())
 
 
 def propose_week(
-    week_start_date: date,            # 月曜
+    week_start_date: date,
     max_day: int,
     max_week: int,
-    wages: dict[str, int],            # workplace -> hourly_wage
-    avails: list[dict],               # availability rows as dict
-    events: list[dict],               # events rows as dict
+    wages: dict[str, int],
+    avails: list[dict],
+    events: list[dict],
     slot_minutes: int = 60,
 ):
     busy = [e for e in events if e["category"] in ("class", "job", "private", "work")]
@@ -283,7 +272,6 @@ def propose_week(
         for b in busy:
             if b["date"] != ds:
                 continue
-            # 終日 busy
             if b["start"] is None or b["end"] is None:
                 return True
             bs, be = _t(b["start"]), _t(b["end"])
@@ -421,34 +409,62 @@ def show_add_event_dialog(selected_date: str):
             if not title.strip():
                 st.error("タイトルを入力してください")
                 return
+
             add_event(selected_date, start_time, end_time, cat_map[category_ui], title.strip(), place.strip() or None)
+
+            # カレンダー再生成して「残りクリック」問題も避ける
             st.session_state["cal_gen"] = st.session_state.get("cal_gen", 0) + 1
             st.session_state["skip_next_dateclick"] = True
             st.rerun()
 
 
+
 # ---------- main ----------
 st.set_page_config(page_title="バイトシフト作成", layout="wide")
+
+st.markdown("""
+    <style>
+    .fc-header-toolbar {
+        display: none !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
 init_db()
 
 st.title("📅 バイトシフト作成アプリ")
 
+# ★ year/month のゴミが残っても影響しないように隔離
+st.session_state.pop("year", None)
+st.session_state.pop("month", None)
+
+
 today = date.today()
 
-if "year" not in st.session_state:
-    st.session_state["year"] = today.year
-if "month" not in st.session_state:
-    st.session_state["month"] = today.month
+# アプリ側の年月
+st.session_state.setdefault("sel_year", today.year)
+st.session_state.setdefault("sel_month", today.month)
 
-c1, c2 = st.columns(2)
-year = c1.number_input("年", 2020, 2035, st.session_state["year"], 1, key="year")
-month = c2.selectbox("月", list(range(1, 13)), index=st.session_state["month"] - 1, key="month")
+# ウィジェット側（year/month を絶対に使わない）
+st.session_state.setdefault("ui_year", st.session_state["sel_year"])
+st.session_state.setdefault("ui_month", st.session_state["sel_month"])
 
+c1, c2 = st.columns([2, 3])
 
-ym_key = f"{year}-{month:02d}"
-if st.session_state.get("ym_key") != ym_key:
-    st.session_state["ym_key"] = ym_key
+ui_year = c1.number_input("年", 2020, 2035, key="ui_year")
+ui_month = c2.selectbox("月", list(range(1, 13)), key="ui_month")
+
+if ui_year != st.session_state["sel_year"] or ui_month != st.session_state["sel_month"]:
+    st.session_state["sel_year"] = int(ui_year)
+    st.session_state["sel_month"] = int(ui_month)
+    st.session_state["cal_gen"] = st.session_state.get("cal_gen", 0) + 1
     st.session_state["skip_next_dateclick"] = True
+    st.rerun()
+
+year = st.session_state["sel_year"]
+month = st.session_state["sel_month"]
+
+
 
 # ---------- Sidebar: shift proposal ----------
 st.sidebar.header("🧠 シフト提案")
@@ -485,7 +501,7 @@ if day_type == "dow":
 a_start = st.sidebar.time_input("開始", value=_t("18:00")).strftime("%H:%M")
 a_end = st.sidebar.time_input("終了", value=_t("22:00")).strftime("%H:%M")
 
-col1, col2 = st.sidebar.columns(2)
+col1, _ = st.sidebar.columns(2)
 if col1.button("追加", use_container_width=True):
     if a_start >= a_end:
         st.sidebar.error("開始 < 終了 にしてください")
@@ -529,11 +545,9 @@ if st.sidebar.button("今週の提案を作成", use_container_width=True):
         start_s = week_start.strftime("%Y-%m-%d")
         end_s = (week_start + timedelta(days=6)).strftime("%Y-%m-%d")
 
-        # 既存proposalを消して作り直し
         delete_proposals_in_range(start_s, end_s)
 
         events_week = fetch_events_between(start_s, end_s)
-
         merged = propose_week(
             week_start_date=week_start,
             max_day=max_day,
@@ -552,17 +566,22 @@ if st.sidebar.button("今週の提案を作成", use_container_width=True):
                 m["start"],
                 m["end"],
                 "proposal",
-                "提案シフト",      # title固定（A）
-                m["workplace"],    # placeに店名
+                "提案シフト",
+                m["workplace"],
             )
             total_h += m["hours"]
             total_income += m["income"]
 
         st.sidebar.success(f"作成：{total_h}時間 / {total_income:,}円")
+
+        # 追加したイベントが表示されるよう、カレンダー再生成
+        st.session_state["cal_gen"] += 1
+        st.session_state["skip_next_dateclick"] = True
         st.rerun()
 
 
-events_by_date = fetch_events_in_month(year, month)
+# ---------- Calendar ----------
+events_by_date = fetch_events_in_month(int(year), int(month))
 
 fc_events = []
 for day_key, evs in events_by_date.items():
@@ -602,97 +621,31 @@ calendar_options = {
     "displayEventTime": False,
     "dayMaxEvents": True,
     "eventDisplay": "block",
-    "headerToolbar": {
-        "left": "today prev,next",
-        "center": "title",
-        "right": "",
-    },
-
+    "headerToolbar": False,
 }
 
 cal_gen = st.session_state.get("cal_gen", 0)
 state = st_calendar(
     events=fc_events,
     options=calendar_options,
-    callbacks=["dateClick", "eventClick", "datesSet"],
-    key=f"calendar_{year}_{month}_{cal_gen}",
+    callbacks=["dateClick", "eventClick"],
+    key=f"calendar_{year}_{month}_{st.session_state['cal_gen']}",
 )
 
-# ★カレンダー矢印で月移動したら、Streamlitのyear/monthも追従させる
-if state and state.get("datesSet"):
-    ds = state["datesSet"]
-
-    # 1) まず view.title を試す（例: "2026年2月" みたいな文字）
-    title = ""
-    if isinstance(ds, dict):
-        view = ds.get("view") or {}
-        if isinstance(view, dict):
-            title = view.get("title") or ""
-
-    # 2) title が取れたらそこから year/month を抜く（日本語でもOK）
-    import re
-    if title:
-        m = re.search(r"(\d{4}).*?(\d{1,2})", title)
-        if m:
-            new_y = int(m.group(1))
-            new_m = int(m.group(2))
-            if (new_y, new_m) != (st.session_state.get("year"), st.session_state.get("month")):
-                st.session_state["year"] = new_y
-                st.session_state["month"] = new_m
-                st.session_state["skip_next_dateclick"] = True
-                st.rerun()
-    else:
-        # 3) titleが無い場合は startStr を fallback（ただしズレやすいので補正する）
-        start_str = (ds.get("startStr") or ds.get("start") or "")[:10]
-        if start_str:
-            y, mth, _ = map(int, start_str.split("-"))
-            # “startStrが前月末”になりやすいので +10日して月を安定化
-            dt = date(y, mth, 1) + timedelta(days=10)
-            new_y, new_m = dt.year, dt.month
-            if (new_y, new_m) != (st.session_state.get("year"), st.session_state.get("month")):
-                st.session_state["year"] = new_y
-                st.session_state["month"] = new_m
-                st.session_state["skip_next_dateclick"] = True
-                st.rerun()
 
 
-# ★カレンダー矢印で月移動したら、Streamlitのyear/monthも追従させる
-if state and state.get("datesSet"):
-    ds = state["datesSet"]
-    start_str = (ds.get("startStr") or ds.get("start") or "")[:10]  # "YYYY-MM-DD"
-
-    if start_str:
-        y, m, _ = map(int, start_str.split("-"))
-        mid = date(y, m, 15)
-
-        st.session_state["year"] = mid.year
-        st.session_state["month"] = mid.month
-
-        st.session_state["skip_next_dateclick"] = True
-        st.rerun()
-
-
-
-# クリックイベントがrerun後に残って勝手にダイアログが開くのを防ぐ
+# dateClick の「残り」を1回捨てる
 if st.session_state.get("skip_next_dateclick", False):
     st.session_state["skip_next_dateclick"] = False
 else:
     if state and state.get("dateClick"):
         dc = state["dateClick"]
-
         raw = dc.get("dateStr") or dc.get("date") or ""
-        clicked_date = raw[:10]  # "YYYY-MM-DD"
-
-        # ★ 表示月(year/month)とズレるバグ対策（なぜか1月になる等）
-        try:
-            y, m, d = map(int, clicked_date.split("-"))
-            if y != int(year) or m != int(month):
-                clicked_date = f"{int(year):04d}-{int(month):02d}-{d:02d}"
-        except Exception:
-            pass
-
+        clicked_date = raw[:10]
         show_add_event_dialog(clicked_date)
 
+
+# ---------- List / Delete ----------
 st.divider()
 st.subheader("🗂 この月の予定一覧（削除）")
 flat = [ev for evs in events_by_date.values() for ev in evs]
@@ -705,8 +658,8 @@ else:
         cols[0].write(f"{ev['date']} | {format_event_label(ev)} | [{ev['category']}]")
         if cols[1].button("削除", key=f"del_{ev['id']}"):
             delete_event(ev["id"])
-
-            # ★ 削除 → rerun でも dateClick が残って再度ダイアログが開くのを防ぐ
-            st.session_state["cal_gen"] = st.session_state.get("cal_gen", 0) + 1
+            st.session_state["cal_gen"] += 1
             st.session_state["skip_next_dateclick"] = True
             st.rerun()
+
+
