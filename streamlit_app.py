@@ -89,6 +89,21 @@ def delete_event(event_id: int):
     conn.commit()
     conn.close()
 
+def update_event(event_id: int, ev_date: str, start_time: Optional[str], end_time: Optional[str],
+                 category: str, title: str, place: Optional[str] = None):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE events
+        SET ev_date=?, start_time=?, end_time=?, category=?, title=?, place=?
+        WHERE id=?
+        """,
+        (ev_date, start_time, end_time, category, title, place, event_id),
+    )
+    conn.commit()
+    conn.close()
+
 
 def fetch_events_in_month(year: int, month: int):
     start = f"{year}-{month:02d}-01"
@@ -151,6 +166,35 @@ def fetch_events_between(start_date: str, end_date: str):
         }
         for r in rows
     ]
+
+
+
+def fetch_event_by_id(event_id: int) -> Optional[dict]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT id, ev_date, start_time, end_time, category, title, place
+        FROM events
+        WHERE id = ?
+        """,
+        (event_id,),
+    )
+    r = cur.fetchone()
+    conn.close()
+    if not r:
+        return None
+    return {
+        "id": r[0],
+        "date": r[1],
+        "start": r[2],
+        "end": r[3],
+        "category": r[4],
+        "title": r[5],
+        "place": r[6],
+    }
+
+
 
 # ---------- DB (proposal config) ----------
 def upsert_settings(max_day: int, max_week: int):
@@ -386,45 +430,165 @@ def format_event_label(ev):
     return ev["title"]
 
 
-@st.dialog("予定を追加")
-def show_add_event_dialog(selected_date: str):
-    st.write(f"📅 **{selected_date}** の予定を入力してください")
-    all_day = st.checkbox("終日", value=False, key="dialog_all_day")
+@st.dialog("予定をまとめて追加（単日 / 連続）")
+def show_bulk_add_dialog():
+    # ★クリックした日を初期値として受け取る（無ければ今日）
+    default_str = st.session_state.get("bulk_default_date")  # "YYYY-MM-DD"
+    if default_str:
+        default_date = datetime.strptime(default_str, "%Y-%m-%d").date()
+    else:
+        default_date = date.today()
 
-    with st.form("dialog_add", clear_on_submit=True):
+    mode = st.radio("日付の選び方", ["単日", "連続（期間）"], horizontal=True)
+
+    selected_dates: list[date] = []
+
+    if mode == "単日":
+        d = st.date_input("日付", value=default_date)  # ★ここ
+        selected_dates = [d]
+    else:
+        st.caption("開始日〜終了日までを毎日追加します")
+        start_d = st.date_input("開始日", value=default_date, key="bulk_start")  # ★ここ
+        end_d = st.date_input("終了日", value=default_date + timedelta(days=3), key="bulk_end")  # ★ここ
+        if start_d <= end_d:
+            cur = start_d
+            while cur <= end_d:
+                selected_dates.append(cur)
+                cur += timedelta(days=1)
+
+
+    st.divider()
+
+    # --- 予定内容 ---
+    all_day = st.checkbox("終日", value=False)
+
+    cat_labels = ["class（授業）", "job（就活）", "private（遊び）", "work（確定バイト）", "proposal（提案シフト）"]
+    cat_map = {
+        "class（授業）": "class",
+        "job（就活）": "job",
+        "private（遊び）": "private",
+        "work（確定バイト）": "work",
+        "proposal（提案シフト）": "proposal",
+    }
+    category_ui = st.selectbox("種別", cat_labels)
+
+    start_time = end_time = None
+    if not all_day:
+        col1, col2 = st.columns(2)
+        st_val = col1.time_input("開始", value=_t("18:00"))
+        et_val = col2.time_input("終了", value=_t("22:00"))
+        start_time = st_val.strftime("%H:%M")
+        end_time = et_val.strftime("%H:%M")
+
+    title = st.text_input("タイトル", placeholder="例：サンマルク")
+    place = st.text_input("場所・店名（任意）")
+
+    if st.button("まとめて追加", use_container_width=True):
+        if not selected_dates:
+            st.error("日付を選択してください")
+            return
+        if not title.strip():
+            st.error("タイトルを入力してください")
+            return
+        if (start_time is not None) and (end_time is not None) and start_time >= end_time:
+            st.error("開始 < 終了 にしてください")
+            return
+
+        cnt = 0
+        for d in selected_dates:
+            add_event(
+                d.strftime("%Y-%m-%d"),
+                start_time,
+                end_time,
+                cat_map[category_ui],
+                title.strip(),
+                place.strip() or None,
+            )
+            cnt += 1
+
+        st.session_state["cal_gen"] = st.session_state.get("cal_gen", 0) + 1
+        st.session_state["skip_next_dateclick"] = True
+        st.session_state.pop("bulk_default_date", None)
+        st.success(f"{cnt}件追加しました")
+        st.rerun()
+
+
+
+@st.dialog("予定を編集")
+def show_edit_event_dialog(ev: dict):
+    # ev: {"id","date","start","end","category","title","place"}
+    st.write(f"🛠 **{ev['date']}** の予定を編集")
+
+    all_day_default = (ev["start"] is None or ev["end"] is None)
+    all_day = st.checkbox("終日", value=all_day_default, key=f"edit_all_day_{ev['id']}")
+
+    cat_labels = ["class（授業）", "job（就活）", "private（遊び）", "work（確定バイト）", "proposal（提案シフト）"]
+    cat_map = {
+        "class（授業）": "class",
+        "job（就活）": "job",
+        "private（遊び）": "private",
+        "work（確定バイト）": "work",
+        "proposal（提案シフト）": "proposal",
+    }
+    rev_map = {v: k for k, v in cat_map.items()}
+
+    with st.form(f"edit_form_{ev['id']}"):
+        new_date = st.date_input("日付", value=datetime.strptime(ev["date"], "%Y-%m-%d").date())
         category_ui = st.selectbox(
             "種別",
-            ["class（授業）", "job（就活）", "private（遊び）", "work（確定バイト）", "proposal（提案シフト）"],
-            key="dialog_cat"
+            cat_labels,
+            index=cat_labels.index(rev_map.get(ev["category"], cat_labels[0])),
         )
-        cat_map = {
-            "class（授業）": "class",
-            "job（就活）": "job",
-            "private（遊び）": "private",
-            "work（確定バイト）": "work",
-            "proposal（提案シフト）": "proposal",
-        }
 
         start_time = end_time = None
         if not all_day:
             col1, col2 = st.columns(2)
-            st_val = col1.time_input("開始", value=_t("10:00"), key="dialog_st")
-            et_val = col2.time_input("終了", value=_t("12:00"), key="dialog_et")
+            st_default = _t(ev["start"]) if ev["start"] else _t("10:00")
+            et_default = _t(ev["end"]) if ev["end"] else _t("12:00")
+            st_val = col1.time_input("開始", value=st_default, key=f"edit_st_{ev['id']}")
+            et_val = col2.time_input("終了", value=et_default, key=f"edit_et_{ev['id']}")
             start_time = st_val.strftime("%H:%M")
             end_time = et_val.strftime("%H:%M")
 
-        title = st.text_input("タイトル", placeholder="例：サンマルク", key="dialog_title")
-        place = st.text_input("場所・店名", key="dialog_place")
+        title = st.text_input("タイトル", value=ev["title"], key=f"edit_title_{ev['id']}")
+        place = st.text_input("場所・店名", value=ev["place"] or "", key=f"edit_place_{ev['id']}")
 
-        submitted = st.form_submit_button("保存する", use_container_width=True)
-        if submitted:
-            if not title.strip():
-                st.error("タイトルを入力してください")
-                return
-            add_event(selected_date, start_time, end_time, cat_map[category_ui], title.strip(), place.strip() or None)
+        c1, c2, c3 = st.columns([2, 2, 2])
+        save = c1.form_submit_button("保存", use_container_width=True)
+        delete = c2.form_submit_button("削除", use_container_width=True)
+        cancel = c3.form_submit_button("キャンセル", use_container_width=True)
+
+        if cancel:
+            st.session_state["skip_next_dateclick"] = True
+            st.rerun()
+
+        if delete:
+            delete_event(int(ev["id"]))
             st.session_state["cal_gen"] = st.session_state.get("cal_gen", 0) + 1
             st.session_state["skip_next_dateclick"] = True
             st.rerun()
+
+        if save:
+            if not title.strip():
+                st.error("タイトルを入力してください")
+                return
+            if (start_time is not None) and (end_time is not None) and start_time >= end_time:
+                st.error("開始 < 終了 にしてください")
+                return
+
+            update_event(
+                int(ev["id"]),
+                new_date.strftime("%Y-%m-%d"),
+                start_time,
+                end_time,
+                cat_map[category_ui],
+                title.strip(),
+                place.strip() or None,
+            )
+            st.session_state["cal_gen"] = st.session_state.get("cal_gen", 0) + 1
+            st.session_state["skip_next_dateclick"] = True
+            st.rerun()
+
 
 
 # ---------- main ----------
@@ -582,6 +746,7 @@ for day_key, evs in events_by_date.items():
             all_day_flag = True
 
         item = {
+            "id": str(ev["id"]),
             "title": format_event_label(ev),
             "start": start,
             "end": end,
@@ -661,19 +826,33 @@ if state and state.get("datesSet"):
                 st.rerun()
 
 
-
-
 # クリックイベントがrerun後に残って勝手にダイアログが開くのを防ぐ
 if st.session_state.get("skip_next_dateclick", False):
     st.session_state["skip_next_dateclick"] = False
 else:
+    # ★ eventClick（予定クリック）→ 編集
+    if state and state.get("eventClick"):
+        ec = state["eventClick"]
+
+        event_id = None
+        if isinstance(ec, dict):
+            event_id = (ec.get("event", {}) or {}).get("id") or ec.get("id")
+
+        if event_id is not None:
+            target = fetch_event_by_id(int(event_id))
+            if target:
+                show_edit_event_dialog(target)
+            else:
+                st.warning("この予定が見つかりませんでした")
+            st.stop()  # ★これ超重要（下に落ちない）
+
+    # ★ dateClick（空白クリック）→ 追加
     if state and state.get("dateClick"):
         dc = state["dateClick"]
-
         raw = dc.get("dateStr") or dc.get("date") or ""
-        clicked_date = raw[:10]  # "YYYY-MM-DD"
+        clicked_date = raw[:10]
 
-        # ★ 表示月(year/month)とズレるバグ対策（なぜか1月になる等）
+        # 表示月とのズレ補正（あなたの既存ロジック）
         try:
             y, m, d = map(int, clicked_date.split("-"))
             if y != int(year) or m != int(month):
@@ -681,7 +860,10 @@ else:
         except Exception:
             pass
 
-        show_add_event_dialog(clicked_date)
+        st.session_state["bulk_default_date"] = clicked_date  # "YYYY-MM-DD" の文字列でOK
+        show_bulk_add_dialog()
+
+
 
 st.divider()
 st.subheader("🗂 この月の予定一覧（削除）")
