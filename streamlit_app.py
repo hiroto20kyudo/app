@@ -1,4 +1,5 @@
 from __future__ import annotations
+import pandas as pd
 
 import sqlite3
 import calendar
@@ -10,6 +11,18 @@ import streamlit as st
 from streamlit_calendar import calendar as st_calendar
 
 DB_PATH = "app.db"
+
+SHIFT_TEMPLATES = {
+    "成城石井": [("10:00", "14:00"), ("17:00", "22:00"), ("18:00", "22:00")],
+    "サンマルク": [
+        ("10:00", "16:00"), ("11:00", "17:00"), ("12:00", "18:00"),
+        ("13:00", "19:00"), ("14:00", "20:00"), ("16:00", "22:00"),
+        ("14:00", "18:00"), ("17:00", "22:00"), ("18:00", "22:00"),
+    ],
+}
+BUFFER_BEFORE_AFTER_MIN = 60
+TRAVEL_BETWEEN_WORKPLACES_MIN = 60
+WORKDAY_PENALTY = 250
 
 
 # ---------- DB ----------
@@ -300,6 +313,19 @@ def delete_proposals_in_range(start_date: str, end_date: str):
     conn.commit()
     conn.close()
 
+def convert_proposals_to_work(start_date: str, end_date: str):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        UPDATE events
+        SET category='work'
+        WHERE category='proposal' AND ev_date BETWEEN ? AND ?
+        """,
+        (start_date, end_date),
+    )
+    conn.commit()
+    conn.close()
 
 
 # ---------- Proposal logic ----------
@@ -309,125 +335,184 @@ def _t(s: str) -> time:
 def monday_of(d: date) -> date:
     return d - timedelta(days=d.weekday())
 
+def month_range(year: int, month: int) -> tuple[date, date]:
+    first = date(year, month, 1)
+    last_day = calendar.monthrange(year, month)[1]
+    last = date(year, month, last_day)
+    return first, last
 
-def propose_week(
-    week_start_date: date,            # 月曜
+def iter_week_starts_in_month(year: int, month: int) -> list[date]:
+    first, last = month_range(year, month)
+    start = monday_of(first)
+    week_starts = []
+    d = start
+    while d <= last:
+        week_starts.append(d)
+        d += timedelta(days=7)
+    return week_starts
+
+
+def propose_week_fixed_slots(
+    week_start_date: date,
     max_day: int,
     max_week: int,
-    wages: dict[str, int],            # workplace -> hourly_wage
-    avails: list[dict],               # availability rows as dict
-    events: list[dict],               # events rows as dict
-    slot_minutes: int = 60,
+    wages: dict[str, int],
+    events: list[dict],
+    seed: int = 0,
+    avail_days: dict[str, list[bool]] | None = None,
 ):
-    busy = [e for e in events if e["category"] in ("class", "job", "private", "work")]
+    import random
+    rnd = random.Random(seed)
 
-    def is_busy(d: date, s: str, e: str) -> bool:
-        ss, ee = _t(s), _t(e)
+    busy = [e for e in events if e["category"] in ("class", "job", "private", "work", "proposal")]
+    busy_days = {e["date"] for e in busy if e.get("date")}
+
+    def to_dt(d: date, hm: str) -> datetime:
+        return datetime.combine(d, _t(hm))
+
+    def overlaps(a_s: datetime, a_e: datetime, b_s: datetime, b_e: datetime) -> bool:
+        return (a_s < b_e) and (b_s < a_e)
+
+    # 予定の前後1hバッファ込みでNG
+    def is_busy_with_buffer(d: date, s: str, e: str) -> bool:
+        ss = to_dt(d, s) - timedelta(minutes=BUFFER_BEFORE_AFTER_MIN)
+        ee = to_dt(d, e) + timedelta(minutes=BUFFER_BEFORE_AFTER_MIN)
         ds = d.strftime("%Y-%m-%d")
+
         for b in busy:
             if b["date"] != ds:
                 continue
-            # 終日 busy
             if b["start"] is None or b["end"] is None:
                 return True
-            bs, be = _t(b["start"]), _t(b["end"])
-            if (ss < be) and (bs < ee):
+            bs = to_dt(d, b["start"])
+            be = to_dt(d, b["end"])
+            if overlaps(ss, ee, bs, be):
                 return True
         return False
 
-    candidates = []  # (d, start, end, workplace, wage)
+    # 同日ダブルOK。ただし店舗が違う場合は移動1h必要
+    def conflicts_with_picked(d: date, s: str, e: str, workplace: str, picked: list[dict]) -> bool:
+        ss = to_dt(d, s)
+        ee = to_dt(d, e)
+        for p in picked:
+            if p["date"] != d.strftime("%Y-%m-%d"):
+                continue
+            ps = to_dt(d, p["start"])
+            pe = to_dt(d, p["end"])
+
+            if p["workplace"] == workplace:
+                if overlaps(ss, ee, ps, pe):
+                    return True
+            else:
+                gap1 = (ss - pe).total_seconds() / 60  # pの後に今回
+                gap2 = (ps - ee).total_seconds() / 60  # 今回の後にp
+                if not (gap1 >= TRAVEL_BETWEEN_WORKPLACES_MIN or gap2 >= TRAVEL_BETWEEN_WORKPLACES_MIN):
+                    return True
+        return False
+
+    # ---- 候補生成（固定枠＋曜日ON/OFF）----
+    candidates = []
     for i in range(7):
         d = week_start_date + timedelta(days=i)
         dow = d.weekday()
-        is_weekend = dow >= 5
+        ds = d.strftime("%Y-%m-%d")
 
-        for a in avails:
-            if a["day_type"] == "weekday" and is_weekend:
-                continue
-            if a["day_type"] == "weekend" and not is_weekend:
-                continue
-            if a["day_type"] == "dow" and a["dow"] != dow:
+        for w, shifts in SHIFT_TEMPLATES.items():
+            # 曜日ON/OFF
+            if avail_days is not None and not avail_days.get(w, [True] * 7)[dow]:
                 continue
 
-            cur = datetime.combine(d, _t(a["start_time"]))
-            end = datetime.combine(d, _t(a["end_time"]))
-            while cur + timedelta(minutes=slot_minutes) <= end:
-                s = cur.strftime("%H:%M")
-                e = (cur + timedelta(minutes=slot_minutes)).strftime("%H:%M")
-                if not is_busy(d, s, e):
-                    w = a["workplace"]
-                    candidates.append((d, s, e, w, wages.get(w, 0)))
-                cur += timedelta(minutes=slot_minutes)
+            wage = wages.get(w, 0)
 
+            for (s, e) in shifts:
+                # 火曜サンマルクはラスト(22:00終了)避け
+                if w == "サンマルク" and dow == 1 and e == "22:00":
+                    continue
+
+                if is_busy_with_buffer(d, s, e):
+                    continue
+
+                hours = int((to_dt(d, e) - to_dt(d, s)).total_seconds() // 3600)
+                candidates.append({
+                    "date": ds,
+                    "start": s,
+                    "end": e,
+                    "workplace": w,
+                    "hours": hours,
+                    "income": hours * wage,
+                })
+
+    # ---- 選択（稼ぎ最大＋働く日の増加を少し抑える）----
     picked = []
-    day_hours: dict[date, int] = {}
-    total = 0
+    day_hours: dict[str, int] = {}
+    workdays = set()
+    total_hours = 0
 
-    def has_adjacent(d, s, e, w):
-        for (d2, s2, e2, w2, _) in picked:
-            if d2 == d and w2 == w and (e2 == s or e == s2):
-                return True
-        return False
+    BUSY_DAY_PENALTY = 3000
+    BUSY_DAY_PENALTY_STM = 7000  # サンマルクだけ強い
 
     def score(c):
-        d, s, e, w, wage = c
-        sc = wage
-        if has_adjacent(d, s, e, w):
-            sc += 200
-        sc -= day_hours.get(d, 0) * 20
+        sc = c["income"]
+
+        if c["date"] in busy_days:
+            if c["workplace"] == "サンマルク":
+                sc -= BUSY_DAY_PENALTY_STM
+            else:
+                sc -= BUSY_DAY_PENALTY
+
+        if c["date"] not in workdays:
+            sc -= WORKDAY_PENALTY
+
+        sc -= day_hours.get(c["date"], 0) * 50
+        sc += rnd.randint(0, 30)
         return sc
 
-    candidates.sort(key=score, reverse=True)
 
-    for c in candidates:
-        d, s, e, w, wage = c
-        if total + 1 > max_week:
-            continue
-        if day_hours.get(d, 0) + 1 > max_day:
-            continue
+    while True:
+        best = None
+        best_sc = -10**18
 
-        conflict = any(d2 == d and not (e <= s2 or e2 <= s) for (d2, s2, e2, _, _) in picked)
-        if conflict:
-            continue
+        for c in candidates:
+            if total_hours + c["hours"] > max_week:
+                continue
+            if day_hours.get(c["date"], 0) + c["hours"] > max_day:
+                continue
 
-        picked.append(c)
-        day_hours[d] = day_hours.get(d, 0) + 1
-        total += 1
+            d_obj = datetime.strptime(c["date"], "%Y-%m-%d").date()
+            if conflicts_with_picked(d_obj, c["start"], c["end"], c["workplace"], picked):
+                continue
 
-    picked.sort(key=lambda x: (x[0], x[3], x[1]))
-    merged = []
-    i = 0
-    while i < len(picked):
-        d, s, e, w, wage = picked[i]
-        j = i + 1
-        cur_s, cur_e = s, e
-        hours = 1
-        while j < len(picked):
-            d2, s2, e2, w2, wage2 = picked[j]
-            if d2 == d and w2 == w and wage2 == wage and s2 == cur_e:
-                cur_e = e2
-                hours += 1
-                j += 1
-            else:
-                break
-        merged.append({
-            "date": d.strftime("%Y-%m-%d"),
-            "start": cur_s,
-            "end": cur_e,
-            "workplace": w,
-            "hours": hours,
-            "income": hours * wage,
-        })
-        i = j
+            sc = score(c)
+            if sc > best_sc:
+                best_sc = sc
+                best = c
 
-    return merged
+        if best is None:
+            break
+
+        picked.append(best)
+        total_hours += best["hours"]
+        day_hours[best["date"]] = day_hours.get(best["date"], 0) + best["hours"]
+        workdays.add(best["date"])
+
+        candidates = [x for x in candidates if not (
+            x["date"] == best["date"]
+            and x["start"] == best["start"]
+            and x["end"] == best["end"]
+            and x["workplace"] == best["workplace"]
+        )]
+
+    picked.sort(key=lambda x: (x["date"], x["start"]))
+    return picked
 
 
 # ---------- UI helpers ----------
 def format_event_label(ev):
+    prefix = "✅ " if ev["category"] == "work" else ""
+    name = ev["place"] or ev["title"]  # 店名優先
     if ev["start"] and ev["end"]:
-        return f'{ev["start"]}-{ev["end"]} {ev["title"]}'
-    return ev["title"]
+        return f'{prefix}{ev["start"]}-{ev["end"]} {name}'
+    return f'{prefix}{name}'
 
 
 @st.dialog("予定をまとめて追加（単日 / 連続）")
@@ -636,102 +721,195 @@ st.sidebar.subheader("時給設定")
 wages = get_wages()
 wp = st.sidebar.selectbox("バイト先", ["サンマルク", "成城石井"])
 w0 = wages.get(wp, 1100)
-wage_val = st.sidebar.number_input("時給（円）", 0, 10000, int(w0), 10)
+wage_val = st.sidebar.number_input("時給（円）", 0, 10000, int(w0), 1)
 if st.sidebar.button("時給を保存", use_container_width=True):
     upsert_wage(wp, int(wage_val))
     st.sidebar.success("保存しました")
 
-# 労働可能時間
-st.sidebar.subheader("労働可能時間帯")
-day_type_ui = st.sidebar.selectbox("曜日タイプ", ["平日", "土日", "曜日指定"])
-day_type = {"平日": "weekday", "土日": "weekend", "曜日指定": "dow"}[day_type_ui]
+# ✅ A案：提案に使う曜日（ON/OFFだけ）
+st.sidebar.subheader("提案に使う曜日（ON/OFF）")
+DOW_LABELS = ["月", "火", "水", "木", "金", "土", "日"]
 
-dow = None
-if day_type == "dow":
-    dow_ui = st.sidebar.selectbox("曜日", ["月", "火", "水", "木", "金", "土", "日"])
-    dow = ["月", "火", "水", "木", "金", "土", "日"].index(dow_ui)
+# 初期化（全部ON）
+if "avail_days" not in st.session_state:
+    st.session_state["avail_days"] = {
+        "サンマルク": [True] * 7,
+        "成城石井": [True] * 7,
+    }
 
-a_start = st.sidebar.time_input("開始", value=_t("18:00")).strftime("%H:%M")
-a_end = st.sidebar.time_input("終了", value=_t("22:00")).strftime("%H:%M")
+wp2 = st.sidebar.selectbox("バイト先（曜日設定）", ["サンマルク", "成城石井"], key="avail_wp")
+days = st.session_state["avail_days"][wp2]
 
-col1, col2 = st.sidebar.columns(2)
-if col1.button("追加", use_container_width=True):
-    if a_start >= a_end:
-        st.sidebar.error("開始 < 終了 にしてください")
-    else:
-        add_availability(wp, day_type, dow, a_start, a_end)
-        st.sidebar.success("追加しました")
-        st.rerun()
+for i, lab in enumerate(DOW_LABELS):
+    days[i] = st.sidebar.checkbox(lab, value=days[i], key=f"avail_{wp2}_{i}")
 
-# 一覧＆削除
-avails = get_availabilities()
-if avails:
-    st.sidebar.caption("登録済み")
-    for a in avails:
-        label = f'{a["workplace"]} | {a["day_type"]}'
-        if a["day_type"] == "dow":
-            label += f'({a["dow"]})'
-        label += f' | {a["start_time"]}-{a["end_time"]}'
-        c1, c2 = st.sidebar.columns([4, 1])
-        c1.write(label)
-        if c2.button("×", key=f"avdel_{a['id']}"):
-            delete_availability(a["id"])
-            st.rerun()
-else:
-    st.sidebar.info("まだ登録がありません")
+st.session_state["avail_days"][wp2] = days
+
 
 # 提案生成
-st.sidebar.subheader("今週の提案")
-week_start = monday_of(date.today())
-st.sidebar.write(f"対象週：{week_start.strftime('%Y-%m-%d')} 〜")
+st.sidebar.subheader("今月の提案")
 
-if st.sidebar.button("今週の提案を作成", use_container_width=True):
+# 別案用seed
+if "proposal_seed" not in st.session_state:
+    st.session_state["proposal_seed"] = 0
+
+first, last = month_range(year, month)
+st.sidebar.write(f"対象：{first.strftime('%Y-%m')}（{first}〜{last}）")
+
+cA, cB = st.sidebar.columns(2)
+if cA.button("別案", use_container_width=True):
+    st.session_state["proposal_seed"] += 1
+if cB.button("seedリセット", use_container_width=True):
+    st.session_state["proposal_seed"] = 0
+
+if st.sidebar.button("今月の提案を作成", use_container_width=True):
     wages = get_wages()
-    avails = get_availabilities()
     max_day, max_week = get_settings()
 
-    if not avails:
-        st.sidebar.error("労働可能時間帯が未登録です")
-    elif not wages:
+    if not wages:
         st.sidebar.error("時給が未登録です")
     else:
-        start_s = week_start.strftime("%Y-%m-%d")
-        end_s = (week_start + timedelta(days=6)).strftime("%Y-%m-%d")
+        start_s = first.strftime("%Y-%m-%d")
+        end_s = last.strftime("%Y-%m-%d")
 
-        # 既存proposalを消して作り直し
         delete_proposals_in_range(start_s, end_s)
-
-        events_week = fetch_events_between(start_s, end_s)
-
-        merged = propose_week(
-            week_start_date=week_start,
-            max_day=max_day,
-            max_week=max_week,
-            wages=wages,
-            avails=avails,
-            events=events_week,
-            slot_minutes=60,
-        )
+        events_month = fetch_events_between(start_s, end_s)
 
         total_h = 0
         total_income = 0
-        for m in merged:
-            add_event(
-                m["date"],
-                m["start"],
-                m["end"],
-                "proposal",
-                "提案シフト",      # title固定（A）
-                m["workplace"],    # placeに店名
-            )
-            total_h += m["hours"]
-            total_income += m["income"]
 
-        st.sidebar.success(f"作成：{total_h}時間 / {total_income:,}円")
+        for wi, ws in enumerate(iter_week_starts_in_month(year, month)):
+            picked = propose_week_fixed_slots(
+                week_start_date=ws,
+                max_day=max_day,
+                max_week=max_week,
+                wages=wages,
+                events=events_month,
+                seed=st.session_state["proposal_seed"] + wi * 101,
+                avail_days=st.session_state["avail_days"],
+            )
+
+            for p in picked:
+                pd = datetime.strptime(p["date"], "%Y-%m-%d").date()
+                if pd < first or pd > last:
+                    continue
+
+                add_event(p["date"], p["start"], p["end"], "proposal",  p["workplace"], p["workplace"])
+
+                # proposal同士も衝突扱いにするため追加
+                events_month.append({
+                    "id": -1,
+                    "date": p["date"],
+                    "start": p["start"],
+                    "end": p["end"],
+                    "category": "proposal",
+                    "title":  p["workplace"],
+                    "place": p["workplace"],
+                })
+
+                total_h += p["hours"]
+                total_income += p["income"]
+
+        st.sidebar.success(f"作成：{total_h}時間 / {total_income:,}円（seed={st.session_state['proposal_seed']}）")
+        st.session_state["cal_gen"] = st.session_state.get("cal_gen", 0) + 1
+        st.session_state["skip_next_dateclick"] = True
         st.rerun()
 
 
+if st.sidebar.button("今月の提案を確定（workへ）", use_container_width=True):
+    convert_proposals_to_work(first.strftime("%Y-%m-%d"), last.strftime("%Y-%m-%d"))
+    st.sidebar.success("確定しました（proposal→work）")
+    st.session_state["cal_gen"] = st.session_state.get("cal_gen", 0) + 1
+    st.session_state["skip_next_dateclick"] = True
+    st.rerun()
+
 events_by_date = fetch_events_in_month(year, month)
+
+# =========================
+# 📊 集計（proposal / work）
+# events_by_date を作った直後に置く
+# =========================
+
+# 1) 月のイベントを平坦化
+flat = [ev for evs in events_by_date.values() for ev in evs]
+
+def build_shift_dataframe(events, category: str):
+    wages = get_wages()  # {"サンマルク": 1100, "成城石井": 1200 ...}
+    rows = []
+
+    for ev in events:
+        if ev.get("category") != category:
+            continue
+        if not ev.get("start") or not ev.get("end"):
+            continue
+
+        wp = ev.get("place") or ev.get("title") or "不明"  # place優先、無ければtitle
+        d = ev["date"]
+        s = ev["start"]
+        e = ev["end"]
+
+        mins = int(
+            (
+                datetime.strptime(f"{d} {e}", "%Y-%m-%d %H:%M")
+                - datetime.strptime(f"{d} {s}", "%Y-%m-%d %H:%M")
+            ).total_seconds() // 60
+        )
+        hours = mins / 60.0
+        income = hours * wages.get(wp, 0)
+
+        rows.append({
+            "date": d,
+            "workplace": wp,
+            "start": s,
+            "end": e,
+            "hours": hours,
+            "income": int(income),
+        })
+
+    return pd.DataFrame(rows)
+
+# 2) proposal と work を両方作る
+df_proposal = build_shift_dataframe(flat, "proposal")
+df_work = build_shift_dataframe(flat, "work")
+
+# 3) 表示
+st.subheader("📊 集計（この月）")
+
+# --- 提案 ---
+st.markdown("### 🧠 提案シフト（proposal）")
+if df_proposal.empty:
+    st.info("この月の提案シフト（proposal）がありません。")
+else:
+    c1, c2, c3 = st.columns(3)
+    c1.metric("件数", f"{len(df_proposal)} 件")
+    c2.metric("合計労働時間", f"{df_proposal['hours'].sum():.1f} h")
+    c3.metric("合計収入(概算)", f"{df_proposal['income'].sum():,} 円")
+
+    with st.expander("店別内訳（proposal）"):
+        st.dataframe(
+            df_proposal.groupby("workplace")[["hours", "income"]]
+            .sum()
+            .reset_index(),
+            use_container_width=True,
+        )
+
+# --- 確定 ---
+st.markdown("### ✅ 確定シフト（work）")
+if df_work.empty:
+    st.info("この月の確定シフト（work）がありません。")
+else:
+    c1, c2, c3 = st.columns(3)
+    c1.metric("件数", f"{len(df_work)} 件")
+    c2.metric("合計労働時間", f"{df_work['hours'].sum():.1f} h")
+    c3.metric("合計収入(確定)", f"{df_work['income'].sum():,} 円")
+
+    with st.expander("店別内訳（work）"):
+        st.dataframe(
+            df_work.groupby("workplace")[["hours", "income"]]
+            .sum()
+            .reset_index(),
+            use_container_width=True,
+        )
 
 fc_events = []
 for day_key, evs in events_by_date.items():
@@ -753,12 +931,16 @@ for day_key, evs in events_by_date.items():
             "allDay": all_day_flag,
         }
 
-        # proposalは店名(place)で色分け（任意）
+        # proposalは店名(place)で色分け
         if ev["category"] == "proposal":
             if ev["place"] == "サンマルク":
-                item["textColor"] = "#E65100"
+                item["backgroundColor"] = "#FFCC80"
+                item["borderColor"] = "#FB8C00"
+                item["textColor"] = "#000000"
             elif ev["place"] == "成城石井":
-                item["textColor"] = "#0D47A1"
+                item["backgroundColor"] = "#FC7B71F5"
+                item["borderColor"] = "#CB886E"
+                item["textColor"] = "#000000"
 
         fc_events.append(item)
 
@@ -867,16 +1049,25 @@ else:
 
 st.divider()
 st.subheader("🗂 この月の予定一覧（削除）")
+
 flat = [ev for evs in events_by_date.values() for ev in evs]
+flat.sort(key=lambda x: (x["date"], x["start"] or "99:99", x["id"]))
+
 if not flat:
     st.info("この月の予定はまだありません。予定を追加してね")
 else:
-    for ev in flat:
-        cols = st.columns([5, 1])
-        cols[0].write(f"{ev['date']} | {format_event_label(ev)} | [{ev['category']}]")
-        if cols[1].button("削除", key=f"del_{ev['id']}"):
-            delete_event(ev["id"])
-            # ★ 削除 → rerun でも dateClick が残って再度ダイアログが開くのを防ぐ
-            st.session_state["cal_gen"] = st.session_state.get("cal_gen", 0) + 1
-            st.session_state["skip_next_dateclick"] = True
-            st.rerun()
+    for i, ev in enumerate(flat):
+        with st.container(border=True):
+            c1, c2 = st.columns([8, 1], vertical_alignment="center")
+
+            label = f"{ev['date']} | {format_event_label(ev)} | [{ev['category']}]"
+            if ev.get("place"):
+                label += f" ＠{ev['place']}"
+            c1.markdown(label)
+
+            # ★ i を混ぜて必ずユニークにする
+            if c2.button("削除", key=f"del_{ev['id']}_{i}", use_container_width=True):
+                delete_event(int(ev["id"]))
+                st.session_state["cal_gen"] = st.session_state.get("cal_gen", 0) + 1
+                st.session_state["skip_next_dateclick"] = True
+                st.rerun()
