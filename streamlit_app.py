@@ -1,12 +1,10 @@
 from __future__ import annotations
 import pandas as pd
-
 import sqlite3
 import calendar
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Optional
-
 import streamlit as st
 from streamlit_calendar import calendar as st_calendar
 
@@ -180,8 +178,6 @@ def fetch_events_between(start_date: str, end_date: str):
         for r in rows
     ]
 
-
-
 def fetch_event_by_id(event_id: int) -> Optional[dict]:
     conn = get_conn()
     cur = conn.cursor()
@@ -206,8 +202,6 @@ def fetch_event_by_id(event_id: int) -> Optional[dict]:
         "title": r[5],
         "place": r[6],
     }
-
-
 
 # ---------- DB (proposal config) ----------
 def upsert_settings(max_day: int, max_week: int):
@@ -822,6 +816,19 @@ if st.sidebar.button("今月の提案を確定（workへ）", use_container_widt
     st.session_state["cal_gen"] = st.session_state.get("cal_gen", 0) + 1
     st.session_state["skip_next_dateclick"] = True
     st.rerun()
+
+st.sidebar.subheader("🗑 提案シフトの管理")
+
+if st.sidebar.button("今月の提案シフトを一括削除", use_container_width=True):
+    delete_proposals_in_range(
+        first.strftime("%Y-%m-%d"),
+        last.strftime("%Y-%m-%d"),
+    )
+    st.sidebar.success("今月の提案シフトをすべて削除しました")
+    st.session_state["cal_gen"] = st.session_state.get("cal_gen", 0) + 1
+    st.session_state["skip_next_dateclick"] = True
+    st.rerun()
+
 
 events_by_date = fetch_events_in_month(year, month)
 
