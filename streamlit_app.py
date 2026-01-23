@@ -2,6 +2,7 @@ from __future__ import annotations
 import pandas as pd
 import sqlite3
 import calendar
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Optional
@@ -307,6 +308,7 @@ def delete_proposals_in_range(start_date: str, end_date: str):
     conn.commit()
     conn.close()
 
+
 def convert_proposals_to_work(start_date: str, end_date: str):
     conn = get_conn()
     cur = conn.cursor()
@@ -367,7 +369,6 @@ def propose_week_fixed_slots(
     def overlaps(a_s: datetime, a_e: datetime, b_s: datetime, b_e: datetime) -> bool:
         return (a_s < b_e) and (b_s < a_e)
 
-    # 予定の前後1hバッファ込みでNG
     def is_busy_with_buffer(d: date, s: str, e: str) -> bool:
         ss = to_dt(d, s) - timedelta(minutes=BUFFER_BEFORE_AFTER_MIN)
         ee = to_dt(d, e) + timedelta(minutes=BUFFER_BEFORE_AFTER_MIN)
@@ -384,7 +385,7 @@ def propose_week_fixed_slots(
                 return True
         return False
 
-    # 同日ダブルOK。ただし店舗が違う場合は移動1h必要
+
     def conflicts_with_picked(d: date, s: str, e: str, workplace: str, picked: list[dict]) -> bool:
         ss = to_dt(d, s)
         ee = to_dt(d, e)
@@ -398,8 +399,8 @@ def propose_week_fixed_slots(
                 if overlaps(ss, ee, ps, pe):
                     return True
             else:
-                gap1 = (ss - pe).total_seconds() / 60  # pの後に今回
-                gap2 = (ps - ee).total_seconds() / 60  # 今回の後にp
+                gap1 = (ss - pe).total_seconds() / 60  
+                gap2 = (ps - ee).total_seconds() / 60  
                 if not (gap1 >= TRAVEL_BETWEEN_WORKPLACES_MIN or gap2 >= TRAVEL_BETWEEN_WORKPLACES_MIN):
                     return True
         return False
@@ -419,7 +420,6 @@ def propose_week_fixed_slots(
             wage = wages.get(w, 0)
 
             for (s, e) in shifts:
-                # 火曜サンマルクはラスト(22:00終了)避け
                 if w == "サンマルク" and dow == 1 and e == "22:00":
                     continue
 
@@ -443,7 +443,7 @@ def propose_week_fixed_slots(
     total_hours = 0
 
     BUSY_DAY_PENALTY = 3000
-    BUSY_DAY_PENALTY_STM = 7000  # サンマルクだけ強い
+    BUSY_DAY_PENALTY_STM = 7000  
 
     def score(c):
         sc = c["income"]
@@ -500,6 +500,7 @@ def propose_week_fixed_slots(
     return picked
 
 
+
 # ---------- UI helpers ----------
 def format_event_label(ev):
     prefix = "✅ " if ev["category"] == "work" else ""
@@ -511,8 +512,7 @@ def format_event_label(ev):
 
 @st.dialog("予定をまとめて追加（単日 / 連続）")
 def show_bulk_add_dialog():
-    # ★クリックした日を初期値として受け取る（無ければ今日）
-    default_str = st.session_state.get("bulk_default_date")  # "YYYY-MM-DD"
+    default_str = st.session_state.get("bulk_default_date")  
     if default_str:
         default_date = datetime.strptime(default_str, "%Y-%m-%d").date()
     else:
@@ -523,12 +523,12 @@ def show_bulk_add_dialog():
     selected_dates: list[date] = []
 
     if mode == "単日":
-        d = st.date_input("日付", value=default_date)  # ★ここ
+        d = st.date_input("日付", value=default_date)  
         selected_dates = [d]
     else:
         st.caption("開始日〜終了日までを毎日追加します")
-        start_d = st.date_input("開始日", value=default_date, key="bulk_start")  # ★ここ
-        end_d = st.date_input("終了日", value=default_date + timedelta(days=3), key="bulk_end")  # ★ここ
+        start_d = st.date_input("開始日", value=default_date, key="bulk_start")  
+        end_d = st.date_input("終了日", value=default_date + timedelta(days=3), key="bulk_end")  
         if start_d <= end_d:
             cur = start_d
             while cur <= end_d:
@@ -841,7 +841,7 @@ events_by_date = fetch_events_in_month(year, month)
 flat = [ev for evs in events_by_date.values() for ev in evs]
 
 def build_shift_dataframe(events, category: str):
-    wages = get_wages()  # {"サンマルク": 1100, "成城石井": 1200 ...}
+    wages = get_wages()  
     rows = []
 
     for ev in events:
@@ -850,7 +850,7 @@ def build_shift_dataframe(events, category: str):
         if not ev.get("start") or not ev.get("end"):
             continue
 
-        wp = ev.get("place") or ev.get("title") or "不明"  # place優先、無ければtitle
+        wp = ev.get("place") or ev.get("title") or "不明"  
         d = ev["date"]
         s = ev["start"]
         e = ev["end"]
@@ -977,7 +977,6 @@ state = st_calendar(
     key=f"calendar_{year}_{month}_{cal_gen}",
 )
 
-# ★カレンダー矢印で月移動したら、Streamlitのyear/monthも追従させる
 if state and state.get("datesSet"):
     ds = state["datesSet"]
 
@@ -988,8 +987,6 @@ if state and state.get("datesSet"):
         if isinstance(view, dict):
             title = view.get("title") or ""
 
-    # 2) title が取れたらそこから year/month を抜く（日本語でもOK）
-    import re
     if title:
         m = re.search(r"(\d{4}).*?(\d{1,2})", title)
         if m:
@@ -1001,11 +998,9 @@ if state and state.get("datesSet"):
                 st.session_state["skip_next_dateclick"] = True
                 st.rerun()
     else:
-        # 3) titleが無い場合は startStr を fallback（ただしズレやすいので補正する）
         start_str = (ds.get("startStr") or ds.get("start") or "")[:10]
         if start_str:
             y, mth, _ = map(int, start_str.split("-"))
-            # “startStrが前月末”になりやすいので +10日して月を安定化
             dt = date(y, mth, 1) + timedelta(days=10)
             new_y, new_m = dt.year, dt.month
             if (new_y, new_m) != (st.session_state.get("year"), st.session_state.get("month")):
@@ -1015,11 +1010,9 @@ if state and state.get("datesSet"):
                 st.rerun()
 
 
-# クリックイベントがrerun後に残って勝手にダイアログが開くのを防ぐ
 if st.session_state.get("skip_next_dateclick", False):
     st.session_state["skip_next_dateclick"] = False
 else:
-    # ★ eventClick（予定クリック）→ 編集
     if state and state.get("eventClick"):
         ec = state["eventClick"]
 
@@ -1033,15 +1026,13 @@ else:
                 show_edit_event_dialog(target)
             else:
                 st.warning("この予定が見つかりませんでした")
-            st.stop()  # ★これ超重要（下に落ちない）
+            st.stop()  
 
-    # ★ dateClick（空白クリック）→ 追加
     if state and state.get("dateClick"):
         dc = state["dateClick"]
         raw = dc.get("dateStr") or dc.get("date") or ""
         clicked_date = raw[:10]
 
-        # 表示月とのズレ補正（あなたの既存ロジック）
         try:
             y, m, d = map(int, clicked_date.split("-"))
             if y != int(year) or m != int(month):
@@ -1049,10 +1040,8 @@ else:
         except Exception:
             pass
 
-        st.session_state["bulk_default_date"] = clicked_date  # "YYYY-MM-DD" の文字列でOK
+        st.session_state["bulk_default_date"] = clicked_date  
         show_bulk_add_dialog()
-
-
 
 st.divider()
 st.subheader("🗂 この月の予定一覧（削除）")
@@ -1072,7 +1061,7 @@ else:
                 label += f" ＠{ev['place']}"
             c1.markdown(label)
 
-            # ★ i を混ぜて必ずユニークにする
+            
             if c2.button("削除", key=f"del_{ev['id']}_{i}", use_container_width=True):
                 delete_event(int(ev["id"]))
                 st.session_state["cal_gen"] = st.session_state.get("cal_gen", 0) + 1
